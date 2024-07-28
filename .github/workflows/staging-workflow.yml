@@ -1,0 +1,134 @@
+name: Staging 
+
+on:
+  push:
+    branches:
+      - staging 
+
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual trigger'
+        required: false
+        default: 'Manual build and deploy'
+
+jobs:
+  cloud_build-local_docker:
+    runs-on: ubuntu-latest
+    if: github.ref != 'refs/heads/dev'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_KEY }}
+          submodules: recursive
+
+      - name: Setup ENV File to Branch
+        run: |
+          # Extract branch name from GITHUB_REF
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          
+          # Define the mapping of branch names to env files
+          declare -A ENV_FILES
+          ENV_FILES[prod]=".env.prod"
+          ENV_FILES[staging]=".env.staging"
+          
+          # Check if there's a matching env file for the branch
+          if [[ -n "${ENV_FILES[$BRANCH_NAME]}" ]]; then
+            ENV_FILE="${ENV_FILES[$BRANCH_NAME]}"
+            if [[ -f "$ENV_FILE" ]]; then
+              echo "Moving $ENV_FILE to .env for branch $BRANCH_NAME"
+              mv "$ENV_FILE" .env
+            else
+              echo "Warning: $ENV_FILE not found. Using default .env file."
+            fi
+          else
+            echo "No specific env file for branch $BRANCH_NAME. Using default .env file."
+          fi
+
+      - name: Update .env file
+        run: |
+          sed -i 's|^MONGO_URI=.*|MONGO_URI=${{ secrets.MAINNET_MONGO_URI }}|' .env
+          sed -i 's|^PRIVATEKEY=.*|PRIVATEKEY=${{ secrets.MAINNET_OWNER_PRIVATEKEY }}|' .env
+          
+          echo "Updated .env file:"
+          cat .env
+
+      - name: Set environment variable
+        run: echo "CI=false" >> $GITHUB_ENV
+
+      - name: Check version
+        run: make version
+
+      - name: Build the docker image
+        run: make composebuild-prod
+
+      - name: Display image_id variable
+        run: make print_image_id
+
+      - name: Compress the image.tar
+        run: make save_image_as_tar
+
+      - name: Set Docker image name & PORT number
+        run: |
+          export FOLDER_NAME=$(make echo_foldername)
+          echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
+          export DOCKER_IMAGE_NAME=$(make echo_docker_image_name)
+          echo "DOCKER_IMAGE_NAME=$DOCKER_IMAGE_NAME" >> $GITHUB_ENV
+          export APPLICATION_PORT=${{vars.STAGING_APPLICATION_PORT}}
+          echo "APPLICATION_PORT=$APPLICATION_PORT" >> $GITHUB_ENV
+      - name: Check files
+        run: ls -a
+
+      - name: SCP file to server
+        uses: appleboy/scp-action@v0.1.4
+        with:
+          host: ${{ secrets.REMOTE_HOST_STAGING }}
+          username: ${{ secrets.REMOTE_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.REMOTE_PORT }}
+          source: "${{ env.DOCKER_IMAGE_NAME }}.tar.gz,Makefile"
+          target: ./${{ env.FOLDER_NAME }}/ # Target is based on the host:username login path. Will create non-existant folders.
+
+      - name: Setup SSH and deploy
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{secrets.REMOTE_HOST_STAGING}}
+          username: ${{secrets.REMOTE_USERNAME}}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.REMOTE_PORT }}
+          script: |
+            cd ${{ env.FOLDER_NAME }}
+            ls
+            # 
+            # Prepare stop & delete
+            # Docker
+            make stop_matching_containers
+            make delete_matching_images
+            # 
+            # Dockerfile
+            if command -v pigz &> /dev/null
+            then
+              unpigz -f "${{ env.DOCKER_IMAGE_NAME }}.tar.gz"
+            else
+              gunzip -f "${{ env.DOCKER_IMAGE_NAME }}.tar.gz"
+            fi
+            #
+            # Load Docker
+            #
+            docker load -i ${{env.DOCKER_IMAGE_NAME}}.tar
+            make print_image_id
+            make run_container PORT=${{ env.APPLICATION_PORT }}
+            # 
+            # Cleanup
+            #
+            #ls
+            rm ${{env.DOCKER_IMAGE_NAME}}.tar
+            rm Makefile
+            cd ..
+            rmdir ${{env.FOLDER_NAME}}
+
+      - name: Print end of script message
+        run: echo "Good Morning... You have arrived at the end of the script 0.0/"
+
